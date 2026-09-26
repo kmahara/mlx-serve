@@ -1541,6 +1541,15 @@ fn parseToolCallsForRequest(
     allocator: std.mem.Allocator,
     text: []const u8,
     tools_json: ?[]const u8,
+    allow_parallel: bool,
+) !?[]chat_mod.ParsedToolCall {
+    return parseToolCallsForRequestNamespaced(allocator, text, tools_json, allow_parallel, null);
+}
+
+fn parseToolCallsForRequestNamespaced(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    tools_json: ?[]const u8,
     /// OpenAI `parallel_tool_calls` (Anthropic spelling:
     /// !tool_choice.disable_parallel_tool_use). false = the client accepts AT
     /// MOST ONE call per response, so the chokepoint keeps the first parsed
@@ -1548,8 +1557,23 @@ fn parseToolCallsForRequest(
     /// first result). Deliberately NOT gated by --no-tool-autocorrect:
     /// client-requested behavior, not a repair heuristic.
     allow_parallel: bool,
+    /// Responses namespace map: a call spelled with the bare child alias is
+    /// rewritten to the declared wire name BEFORE the filter below, so schema
+    /// operations see the tool as declared (the reshaped tools JSON carries
+    /// only wire names).
+    namespace_aliases: ?*const responses_mod.NamespaceAliases,
 ) !?[]chat_mod.ParsedToolCall {
     var parsed_calls = try chat_mod.parseToolCalls(allocator, text);
+    if (namespace_aliases) |al| if (parsed_calls) |c| {
+        responses_mod.resolveNamespacedCallNames(allocator, al, c) catch |err| {
+            for (c) |tc| {
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(c);
+            return err;
+        };
+    };
     // Heuristically-inferred raw-JSON calls must name a DECLARED tool — a
     // truncated data object ({"name": "George Washington", …}) is not a call.
     // Deliberately NOT gated on g_tool_autocorrect: this corrects our own
@@ -16877,7 +16901,11 @@ fn handleResponsesCompact(
 
     // ── parse → resolved message history ──
     // Compaction drops images, so the preprocessing selector is irrelevant here.
-    // No tool aliases are built: an echoed call keeps the name it was declared with.
+    // No tool aliases are built: an echoed call keeps the name it was declared
+    // with. The main path rewrites a bare-alias echo to the declared wire name,
+    // so a namespaced call spells differently across a compaction boundary —
+    // accepted: the blob already drops tool calls and images, so prefix reuse
+    // is lost at the boundary regardless of spelling.
     var pi = responses_mod.parseInput(allocator, input_val, instructions, prev_messages, null, appendImageUrlContent, .{}) catch |err| {
         log.warn("POST /v1/responses/compact -> 400 (input parse: {s})\n", .{@errorName(err)});
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Failed to parse input", 400);
@@ -17870,7 +17898,7 @@ fn handleResponsesInner(
 
     var tool_calls: ?[]chat_mod.ParsedToolCall = null;
     if (active_has_tools and shouldParseToolCalls(result.finish_details)) {
-        tool_calls = try parseToolCallsForRequest(allocator, final_text, active_tools_json, parallel_tool_calls_echo);
+        tool_calls = try parseToolCallsForRequestNamespaced(allocator, final_text, active_tools_json, parallel_tool_calls_echo, &namespace_aliases);
     }
     defer if (tool_calls) |tcs| {
         for (tcs) |tc| {
@@ -20838,6 +20866,69 @@ test "prefix cache default capacity covers interleaved agent flows" {
     // still bounds memory.
     try testing.expect(prefix_cache_capacity >= 4);
     try testing.expect(resolvedPrefixCacheMem() > 0);
+}
+
+test "parseToolCallsForRequest coerces a bare-alias namespaced call" {
+    // A model that drops the namespace prefix is answered by the bare-child
+    // alias, but the reshaped tools JSON carries only the wire name — the
+    // chokepoint must resolve the alias to the wire name before filtering,
+    // hoisting and coercing, and the call must keep its wire name for the
+    // handler's split back to (namespace, name).
+    const allocator = std.testing.allocator;
+    const tools =
+        \\[{"type":"namespace","name":"mcp__demo__","tools":[{"type":"function","name":"Edit","parameters":{"type":"object","properties":{"file_path":{"type":"string"},"replace_all":{"type":"boolean"}},"required":["file_path"]}}]}]
+    ;
+    const parsed_tools = try std.json.parseFromSlice(std.json.Value, allocator, tools, .{});
+    defer parsed_tools.deinit();
+    var aliases = responses_mod.NamespaceAliases.init(allocator);
+    defer responses_mod.freeNamespaceAliases(allocator, &aliases);
+    const reshaped = try responses_mod.buildToolsJson(allocator, parsed_tools.value.array, &aliases);
+    defer allocator.free(reshaped);
+
+    const text = "<tool_call>\n<function=Edit>\n<parameter=file_path>\n/tmp/x\n</parameter>\n" ++
+        "<parameter=replace_all>\nFalse\n</parameter>\n</function>\n</tool_call>";
+    const calls = (try parseToolCallsForRequestNamespaced(allocator, text, reshaped, true, &aliases)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqualStrings("mcp__demo__Edit", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    const ra = parsed.value.object.get("replace_all").?;
+    try testing.expect(ra == .bool); // coerced from the STRING "False"
+    try testing.expectEqual(false, ra.bool);
+}
+
+test "parseToolCallsForRequest frees calls when namespace alias rewrite fails" {
+    const allocator = std.testing.allocator;
+    const tools =
+        \\[{"type":"namespace","name":"mcp__demo__","tools":[{"type":"function","name":"Edit","parameters":{}}]}]
+    ;
+    const parsed_tools = try std.json.parseFromSlice(std.json.Value, allocator, tools, .{});
+    defer parsed_tools.deinit();
+    var aliases = responses_mod.NamespaceAliases.init(allocator);
+    defer responses_mod.freeNamespaceAliases(allocator, &aliases);
+    const reshaped = try responses_mod.buildToolsJson(allocator, parsed_tools.value.array, &aliases);
+    defer allocator.free(reshaped);
+
+    const text = "<tool_call>\n<function=Edit>\n<parameter=file_path>\n/tmp/x\n</parameter>\n</function>\n</tool_call>";
+    var counter = std.testing.FailingAllocator.init(allocator, .{});
+    const parsed_calls = (try chat_mod.parseToolCalls(counter.allocator(), text)).?;
+    for (parsed_calls) |tc| {
+        counter.allocator().free(tc.name);
+        counter.allocator().free(tc.arguments);
+    }
+    counter.allocator().free(parsed_calls);
+
+    // The first allocation after parsing builds the joined name; the next
+    // duplicates the declared wire name, whose failure must release the calls.
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = counter.alloc_index + 1 });
+    try std.testing.expectError(error.OutOfMemory, parseToolCallsForRequestNamespaced(failing.allocator(), text, reshaped, true, &aliases));
+    try std.testing.expect(failing.has_induced_failure);
 }
 
 test "parseToolCallsForRequest coerces args to the schema (server-side chokepoint wiring)" {

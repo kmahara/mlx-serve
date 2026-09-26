@@ -471,6 +471,26 @@ fn declaredWireName(
     return null;
 }
 
+/// Rewrite a call the model spelled with a registered alias (the bare child
+/// name) to the wire name the turn declared, so the request chokepoint's
+/// schema filter, hoist and coercion all see the tool as declared. Wire- and
+/// flat-spelled names are left alone; the handler still splits the result
+/// back with `splitNamespaceToolName`.
+pub fn resolveNamespacedCallNames(
+    allocator: std.mem.Allocator,
+    aliases: *const NamespaceAliases,
+    calls: []chat_mod.ParsedToolCall,
+) !void {
+    for (calls) |*tc| {
+        const entry = aliases.aliases.get(tc.name) orelse continue;
+        const wire = declaredWireName(allocator, aliases, entry.namespace, entry.name) orelse continue;
+        if (std.mem.eql(u8, wire, tc.name)) continue;
+        const owned = try allocator.dupe(u8, wire);
+        allocator.free(tc.name);
+        tc.name = owned;
+    }
+}
+
 // ─── output-item JSON builders ────────────────────────────────────────────
 
 pub fn appendOutputTextMessage(
@@ -737,13 +757,24 @@ fn appendMessageItem(
                 };
             }
             if (text_parts.items.len > 0) {
-                const owned = try allocator.dupe(u8, text_parts.items);
-                try pi.owned_strings.append(allocator, owned);
+                const owned = blk: {
+                    const slice = try text_parts.toOwnedSlice(allocator);
+                    errdefer allocator.free(slice);
+                    try pi.owned_strings.append(allocator, slice);
+                    break :blk slice;
+                };
                 content = owned;
             }
             if (image_list.items.len > 0) {
-                const owned = try image_list.toOwnedSlice(allocator);
-                try pi.owned_images.append(allocator, owned);
+                const owned = blk: {
+                    const slice = try image_list.toOwnedSlice(allocator);
+                    errdefer {
+                        for (slice) |img| allocator.free(img.pixels);
+                        allocator.free(slice);
+                    }
+                    try pi.owned_images.append(allocator, slice);
+                    break :blk slice;
+                };
                 images = owned;
             } else {
                 image_list.deinit(allocator);
@@ -808,7 +839,8 @@ fn appendFunctionCallOutputItem(
                 defer parts.deinit(allocator);
                 try appendTextParts(allocator, &parts, arr.items);
                 if (parts.items.len > 0) {
-                    const owned = try allocator.dupe(u8, parts.items);
+                    const owned = try parts.toOwnedSlice(allocator);
+                    errdefer allocator.free(owned);
                     try pi.owned_strings.append(allocator, owned);
                     output = owned;
                 }
@@ -898,10 +930,20 @@ fn appendCompactionInputItem(
 
         // Inner JSON values are owned by `parsed` (freed at scope end).
         // Dupe both fields so they outlive this function.
-        const role_owned = try allocator.dupe(u8, role_val.string);
-        try pi.owned_strings.append(allocator, role_owned);
-        const content_owned = try allocator.dupe(u8, content_val.string);
-        try pi.owned_strings.append(allocator, content_owned);
+        // The errdefer must retire at registration: a later fallible step in
+        // this block must not free a string the list already owns.
+        const role_owned = blk: {
+            const owned = try allocator.dupe(u8, role_val.string);
+            errdefer allocator.free(owned);
+            try pi.owned_strings.append(allocator, owned);
+            break :blk owned;
+        };
+        const content_owned = blk: {
+            const owned = try allocator.dupe(u8, content_val.string);
+            errdefer allocator.free(owned);
+            try pi.owned_strings.append(allocator, owned);
+            break :blk owned;
+        };
 
         try pi.messages.append(allocator, .{
             .role = role_owned,
@@ -1342,6 +1384,161 @@ test "buildToolsJson namespaced output is independent of the aliases map" {
     try testing.expect(std.mem.indexOf(u8, out_null, "\"name\":\"mcp__demo__00000000\"") != null);
     try testing.expect(std.mem.indexOf(u8, out_null, "\"name\":\"mcp__demo__00000623\"") != null);
     try testing.expect(std.mem.indexOf(u8, out_null, "mcp__demo__00000623_2") == null);
+}
+
+// Transparent counting wrapper: forwards to base and fails the (left+1)-th
+// alloc. `std.testing.allocator` is the leak oracle for the sweep below.
+const FailAt = struct {
+    const Self = @This();
+    const Allocator = std.mem.Allocator;
+    const Alignment = std.mem.Alignment;
+    base: std.mem.Allocator,
+    left: usize,
+    fn selfOf(ctx: *anyopaque) *Self {
+        return @ptrCast(@alignCast(ctx));
+    }
+    fn rawAlloc(ctx: *anyopaque, len: usize, alignment: Alignment, ra: usize) ?[*]u8 {
+        const self = selfOf(ctx);
+        if (self.left == 0) return null;
+        self.left -= 1;
+        return self.base.rawAlloc(len, alignment, ra);
+    }
+    fn rawFree(ctx: *anyopaque, memory: []u8, alignment: Alignment, ra: usize) void {
+        selfOf(ctx).base.rawFree(memory, alignment, ra);
+    }
+    // Refusing resize/remap keeps every growth a counted raw alloc, so the
+    // sweep can fail each one (an in-place resize would absorb the failure).
+    fn rawResize(_: *anyopaque, _: []u8, _: Alignment, _: usize, _: usize) bool {
+        return false;
+    }
+    fn rawRemap(_: *anyopaque, _: []u8, _: Alignment, _: usize, _: usize) ?[*]u8 {
+        return null;
+    }
+    const VTable = Allocator.VTable;
+    const vtable = VTable{ .alloc = rawAlloc, .resize = rawResize, .remap = rawRemap, .free = rawFree };
+    fn allocator(self: *Self) Allocator {
+        return Allocator{ .ptr = self, .vtable = &vtable };
+    }
+};
+
+/// Dry-runs `call` to count its allocations, then re-runs it failing each
+/// allocation in turn. Bar: no iteration leaves anything unfreed — the testing
+/// allocator reports a survivor at test end. An iteration whose OOM the callee
+/// swallows (a `catch return` short-circuit) returns OK and is re-run at a
+/// higher allowance; the dry-run count guarantees every allocation is covered.
+fn expectNoLeakAtEveryAllocFailure(
+    comptime call: fn (std.mem.Allocator, std.json.ObjectMap) anyerror!void,
+    obj: std.json.ObjectMap,
+) !void {
+    var dry = FailAt{ .base = testing.allocator, .left = std.math.maxInt(usize) };
+    try call(dry.allocator(), obj);
+    const total = std.math.maxInt(usize) - dry.left;
+    var allowed: usize = 0;
+    while (allowed < total) : (allowed += 1) {
+        var fail_at = FailAt{ .base = testing.allocator, .left = allowed };
+        call(fail_at.allocator(), obj) catch |err| {
+            if (err == error.OutOfMemory) continue;
+            return err;
+        };
+    }
+}
+
+fn newParsedInput(alloc: std.mem.Allocator) ParsedInput {
+    return .{
+        .messages = .empty,
+        .owned_strings = .empty,
+        .owned_tool_calls = .empty,
+        .owned_images = .empty,
+        .allocator = alloc,
+    };
+}
+
+// Each sweep checks the effect on a clean success, so the dry run proves the
+// input actually reaches the dupe-and-register path.
+fn sweepOutputItem(alloc: std.mem.Allocator, obj: std.json.ObjectMap) !void {
+    var pi = newParsedInput(alloc);
+    defer pi.deinit();
+    try appendFunctionCallOutputItem(alloc, &pi, obj);
+    if (pi.messages.items.len > 0) {
+        try testing.expectEqualStrings("tool", pi.messages.items[0].role);
+    }
+}
+
+fn sweepMessageItem(alloc: std.mem.Allocator, obj: std.json.ObjectMap) !void {
+    var pi = newParsedInput(alloc);
+    defer pi.deinit();
+    try appendMessageItem(alloc, &pi, obj, null, .{});
+    if (pi.messages.items.len > 0) {
+        try testing.expectEqualStrings("user", pi.messages.items[0].role);
+    }
+}
+
+fn testImageDecoder(alloc: std.mem.Allocator, list: *std.ArrayList(chat_mod.ImageData), _: []const u8, _: chat_mod.VisionPreproc) bool {
+    const pixels = alloc.alloc(u8, 4) catch return false;
+    list.append(alloc, .{ .pixels = pixels, .width = 1, .height = 1 }) catch {
+        alloc.free(pixels);
+        return false;
+    };
+    return true;
+}
+
+fn sweepMessageWithImage(alloc: std.mem.Allocator, obj: std.json.ObjectMap) !void {
+    var pi = newParsedInput(alloc);
+    defer pi.deinit();
+    try appendMessageItem(alloc, &pi, obj, testImageDecoder, .{});
+    if (!pi.image_decode_failed) {
+        try testing.expectEqual(@as(usize, 1), pi.messages.items.len);
+        try testing.expectEqual(@as(usize, 1), pi.messages.items[0].images.?.len);
+    }
+}
+
+fn sweepCompactionItem(alloc: std.mem.Allocator, obj: std.json.ObjectMap) !void {
+    var pi = newParsedInput(alloc);
+    defer pi.deinit();
+    try appendCompactionInputItem(alloc, &pi, obj);
+    if (pi.messages.items.len > 0) {
+        try testing.expectEqual(@as(usize, 1), pi.messages.items.len);
+    }
+}
+
+test "appendFunctionCallOutputItem frees the joined output at every allocation failure" {
+    const json =
+        \\{"call_id":"call_1","output":[{"type":"input_text","text":"Wall time: 1.0 seconds"},{"type":"input_text","text":"Title: HELLO"}]}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+    try expectNoLeakAtEveryAllocFailure(sweepOutputItem, parsed.value.object);
+}
+
+test "appendMessageItem frees the joined content at every allocation failure" {
+    const json =
+        \\{"role":"user","content":[{"type":"input_text","text":"hello there"},{"type":"input_text","text":"and more"}]}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+    try expectNoLeakAtEveryAllocFailure(sweepMessageItem, parsed.value.object);
+}
+
+test "appendMessageItem owns mixed text and image at every allocation failure" {
+    const json =
+        \\{"role":"user","content":[{"type":"input_text","text":"describe this"},{"type":"input_image","image_url":"test://image"}]}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+    try expectNoLeakAtEveryAllocFailure(sweepMessageWithImage, parsed.value.object);
+}
+
+test "appendCompactionInputItem frees its dupes at every allocation failure" {
+    const msgs = [_]chat_mod.Message{.{ .role = "user", .content = "hello there" }};
+    const blob = try encodeCompactionBlob(testing.allocator, &msgs);
+    defer testing.allocator.free(blob);
+    const json = try std.fmt.allocPrint(testing.allocator,
+        \\{{"type":"compaction","encrypted_content":"{s}"}}
+    , .{blob});
+    defer testing.allocator.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+    try expectNoLeakAtEveryAllocFailure(sweepCompactionItem, parsed.value.object);
 }
 
 test "parseInput rewrites a namespaced function_call echo to its declared wire name" {
